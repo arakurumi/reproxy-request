@@ -1,22 +1,34 @@
-const REQUEST_HOP_HEADERS = new Set([
+const REQUEST_DROP_HEADERS = new Set([
   "connection",
   "content-length",
+  "cookie",
+  "forwarded",
   "host",
   "keep-alive",
+  "origin",
   "proxy-authenticate",
   "proxy-authorization",
+  "referer",
   "te",
   "trailer",
   "transfer-encoding",
   "upgrade",
+  "via",
+  "x-forwarded-for",
+  "x-forwarded-host",
+  "x-forwarded-proto",
+  "x-real-ip",
 ]);
 
-const RESPONSE_HOP_HEADERS = new Set([
+const RESPONSE_DROP_HEADERS = new Set([
   "connection",
+  "content-security-policy",
+  "content-security-policy-report-only",
   "content-length",
   "keep-alive",
   "proxy-authenticate",
   "proxy-authorization",
+  "set-cookie",
   "te",
   "trailer",
   "transfer-encoding",
@@ -42,6 +54,21 @@ function json(status, message) {
 
 function firstHeader(headers, name, fallback = "") {
   return headers.get(name)?.split(",")[0]?.trim() || fallback;
+}
+
+function shouldDropRequestHeader(key) {
+  const lower = key.toLowerCase();
+
+  return (
+    REQUEST_DROP_HEADERS.has(lower) ||
+    lower === "accept-encoding" ||
+    lower === "cdn-loop" ||
+    lower === "priority" ||
+    lower.startsWith("cf-") ||
+    lower.startsWith("sec-") ||
+    lower.startsWith("x-now-") ||
+    lower.startsWith("x-vercel-")
+  );
 }
 
 function getProxyOrigin(request) {
@@ -119,7 +146,7 @@ function buildRequestHeaders(request, targetUrl, proxyOrigin) {
   const headers = new Headers();
 
   request.headers.forEach((value, key) => {
-    if (!REQUEST_HOP_HEADERS.has(key.toLowerCase())) {
+    if (!shouldDropRequestHeader(key)) {
       headers.set(key, value);
     }
   });
@@ -226,21 +253,10 @@ function buildResponseHeaders(upstream, proxyOrigin, targetUrl) {
     "cache-control": "no-store",
   });
 
-  if (typeof upstream.headers.getSetCookie === "function") {
-    for (const cookie of upstream.headers.getSetCookie()) {
-      headers.append("set-cookie", cookie);
-    }
-  }
-
   upstream.headers.forEach((value, key) => {
     const lower = key.toLowerCase();
 
-    if (
-      lower === "set-cookie" ||
-      lower === "content-security-policy" ||
-      lower === "content-security-policy-report-only" ||
-      RESPONSE_HOP_HEADERS.has(lower)
-    ) {
+    if (RESPONSE_DROP_HEADERS.has(lower)) {
       return;
     }
 
