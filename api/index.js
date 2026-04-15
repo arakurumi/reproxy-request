@@ -39,6 +39,28 @@ function getForwardedHeader(headers, name, fallback = "") {
   return headers.get(name)?.split(",")[0]?.trim() || fallback;
 }
 
+function getRequestOrigin(request) {
+  const requestUrl = new URL(request.url);
+  const host =
+    getForwardedHeader(request.headers, "x-forwarded-host") ||
+    request.headers.get("host") ||
+    requestUrl.host;
+  const protocol =
+    getForwardedHeader(
+      request.headers,
+      "x-forwarded-proto",
+      requestUrl.protocol.replace(":", ""),
+    ) || "https";
+
+  return { host, protocol };
+}
+
+function getProxyBaseUrl(request) {
+  const { host, protocol } = getRequestOrigin(request);
+
+  return host ? `${protocol}://${host}` : "";
+}
+
 function getProxyPath(url) {
   const rewrittenPath = url.searchParams.get(PATH_QUERY_KEY);
 
@@ -126,15 +148,8 @@ function buildRequestHeaders(request, targetUrl) {
   headers.set("accept-encoding", "identity");
 
   const forwardedFor = getForwardedHeader(request.headers, "x-forwarded-for");
-  const forwardedHost =
-    getForwardedHeader(request.headers, "x-forwarded-host") ||
-    request.headers.get("host") ||
-    "";
-  const forwardedProto = getForwardedHeader(
-    request.headers,
-    "x-forwarded-proto",
-    "https",
-  );
+  const { host: forwardedHost, protocol: forwardedProto } =
+    getRequestOrigin(request);
 
   if (forwardedFor) {
     headers.set("x-forwarded-for", forwardedFor);
@@ -149,35 +164,111 @@ function buildRequestHeaders(request, targetUrl) {
   return headers;
 }
 
-function rewriteLocationHeader(location, request, targetUrl) {
-  const host =
-    getForwardedHeader(request.headers, "x-forwarded-host") ||
-    request.headers.get("host") ||
-    "";
-  const protocol = getForwardedHeader(
-    request.headers,
-    "x-forwarded-proto",
-    "https",
-  );
+function toProxyUrl(value, request, targetUrl) {
+  if (!value) {
+    return value;
+  }
 
-  if (!host) {
-    return location;
+  const trimmed = value.trim();
+
+  if (
+    !trimmed ||
+    trimmed.startsWith("#") ||
+    trimmed.startsWith("data:") ||
+    trimmed.startsWith("javascript:") ||
+    trimmed.startsWith("mailto:") ||
+    trimmed.startsWith("tel:")
+  ) {
+    return value;
+  }
+
+  const proxyBaseUrl = getProxyBaseUrl(request);
+
+  if (!proxyBaseUrl) {
+    return value;
   }
 
   try {
-    const resolved = new URL(location, targetUrl);
+    const absolute = trimmed.startsWith("//")
+      ? new URL(`${targetUrl.protocol}${trimmed}`)
+      : new URL(trimmed, targetUrl);
 
-    if (resolved.protocol !== "http:" && resolved.protocol !== "https:") {
-      return location;
+    if (absolute.protocol !== "http:" && absolute.protocol !== "https:") {
+      return value;
     }
 
-    return new URL(
-      `/${resolved.toString()}`,
-      `${protocol}://${host}`,
-    ).toString();
+    return new URL(`/${absolute.toString()}`, proxyBaseUrl).toString();
   } catch {
-    return location;
+    return value;
   }
+}
+
+function rewriteLocationHeader(location, request, targetUrl) {
+  return toProxyUrl(location, request, targetUrl);
+}
+
+function rewriteSrcset(value, request, targetUrl) {
+  return value
+    .split(",")
+    .map((candidate) => {
+      const trimmed = candidate.trim();
+
+      if (!trimmed) {
+        return trimmed;
+      }
+
+      const firstSpace = trimmed.search(/\s/);
+
+      if (firstSpace === -1) {
+        return toProxyUrl(trimmed, request, targetUrl);
+      }
+
+      const urlPart = trimmed.slice(0, firstSpace);
+      const descriptor = trimmed.slice(firstSpace);
+
+      return `${toProxyUrl(urlPart, request, targetUrl)}${descriptor}`;
+    })
+    .join(", ");
+}
+
+function rewriteHtml(html, request, targetUrl) {
+  return html
+    .replace(
+      /\b(href|src|action|poster)=("([^"]*)"|'([^']*)')/gi,
+      (match, attr, quoted, doubleValue, singleValue) => {
+        const original = doubleValue ?? singleValue ?? "";
+        const rewritten = toProxyUrl(original, request, targetUrl);
+        const quote = quoted[0];
+        return `${attr}=${quote}${rewritten}${quote}`;
+      },
+    )
+    .replace(
+      /\bsrcset=("([^"]*)"|'([^']*)')/gi,
+      (match, quoted, doubleValue, singleValue) => {
+        const original = doubleValue ?? singleValue ?? "";
+        const rewritten = rewriteSrcset(original, request, targetUrl);
+        const quote = quoted[0];
+        return `srcset=${quote}${rewritten}${quote}`;
+      },
+    )
+    .replace(
+      /\bcontent=("([^"]*)"|'([^']*)')/gi,
+      (match, quoted, doubleValue, singleValue) => {
+        const original = doubleValue ?? singleValue ?? "";
+        const rewritten = original.replace(
+          /(\s*;\s*url=)([^;]+)/i,
+          (full, prefix, target) =>
+            `${prefix}${toProxyUrl(target, request, targetUrl)}`,
+        );
+
+        if (rewritten === original) {
+          return match;
+        }
+
+        const quote = quoted[0];
+        return `content=${quote}${rewritten}${quote}`;
+      },
+    );
 }
 
 function buildResponseHeaders(upstream, request, targetUrl) {
@@ -195,6 +286,13 @@ function buildResponseHeaders(upstream, request, targetUrl) {
     const lower = key.toLowerCase();
 
     if (lower === "set-cookie" || HOP_BY_HOP_RESPONSE_HEADERS.has(lower)) {
+      return;
+    }
+
+    if (
+      lower === "content-security-policy" ||
+      lower === "content-security-policy-report-only"
+    ) {
       return;
     }
 
@@ -272,10 +370,24 @@ export default async function handler(request) {
       return json(upstream.status, await getErrorMessage(upstream));
     }
 
+    const contentType = upstream.headers.get("content-type") || "";
+    const headers = buildResponseHeaders(upstream, request, targetUrl);
+
+    if (contentType.includes("text/html")) {
+      return new Response(
+        rewriteHtml(await upstream.text(), request, targetUrl),
+        {
+          status: upstream.status,
+          statusText: upstream.statusText,
+          headers,
+        },
+      );
+    }
+
     return new Response(request.method === "HEAD" ? null : upstream.body, {
       status: upstream.status,
       statusText: upstream.statusText,
-      headers: buildResponseHeaders(upstream, request, targetUrl),
+      headers,
     });
   } catch (error) {
     return json(
