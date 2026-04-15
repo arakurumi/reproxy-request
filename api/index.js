@@ -1,4 +1,4 @@
-const HOP_BY_HOP_REQUEST_HEADERS = new Set([
+const REQUEST_HOP_HEADERS = new Set([
   "connection",
   "content-length",
   "host",
@@ -11,7 +11,7 @@ const HOP_BY_HOP_REQUEST_HEADERS = new Set([
   "upgrade",
 ]);
 
-const HOP_BY_HOP_RESPONSE_HEADERS = new Set([
+const RESPONSE_HOP_HEADERS = new Set([
   "connection",
   "content-length",
   "keep-alive",
@@ -23,168 +23,130 @@ const HOP_BY_HOP_RESPONSE_HEADERS = new Set([
   "upgrade",
 ]);
 
-const PATH_QUERY_KEY = "url";
+const PROXY_PARAM = "url";
+const JSON_HEADERS = {
+  "cache-control": "no-store",
+  "content-type": "application/json; charset=utf-8",
+};
+
+function httpError(statusCode, message) {
+  return Object.assign(new Error(message), { statusCode });
+}
 
 function json(status, message) {
   return new Response(JSON.stringify({ status, message }), {
     status,
-    headers: {
-      "cache-control": "no-store",
-      "content-type": "application/json; charset=utf-8",
-    },
+    headers: JSON_HEADERS,
   });
 }
 
-function getForwardedHeader(headers, name, fallback = "") {
+function firstHeader(headers, name, fallback = "") {
   return headers.get(name)?.split(",")[0]?.trim() || fallback;
 }
 
-function getRequestOrigin(request) {
+function getProxyOrigin(request) {
   const requestUrl = new URL(request.url);
-  const host =
-    getForwardedHeader(request.headers, "x-forwarded-host") ||
-    request.headers.get("host") ||
-    requestUrl.host;
+  const host = firstHeader(
+    request.headers,
+    "x-forwarded-host",
+    request.headers.get("host") || requestUrl.host,
+  );
   const protocol =
-    getForwardedHeader(
+    firstHeader(
       request.headers,
       "x-forwarded-proto",
-      requestUrl.protocol.replace(":", ""),
+      requestUrl.protocol.slice(0, -1),
     ) || "https";
-
-  return { host, protocol };
-}
-
-function getProxyBaseUrl(request) {
-  const { host, protocol } = getRequestOrigin(request);
 
   return host ? `${protocol}://${host}` : "";
 }
 
-function getProxyPath(url) {
-  const rewrittenPath = url.searchParams.get(PATH_QUERY_KEY);
+function buildTargetUrl(requestUrl) {
+  const source =
+    requestUrl.searchParams.get(PROXY_PARAM) ||
+    (requestUrl.pathname.startsWith("/api/")
+      ? requestUrl.pathname.slice("/api/".length)
+      : "");
 
-  if (rewrittenPath) {
-    return rewrittenPath;
-  }
-
-  if (url.pathname.startsWith("/api/")) {
-    return url.pathname.slice("/api/".length);
-  }
-
-  return "";
-}
-
-function buildTargetUrl(url) {
-  const encodedPath = getProxyPath(url);
-
-  if (!encodedPath) {
+  if (!source) {
     return null;
   }
 
   let rawPath;
 
   try {
-    rawPath = decodeURIComponent(encodedPath).replace(
+    rawPath = decodeURIComponent(source).replace(
       /^(https?):\/(?!\/)/i,
       "$1://",
     );
   } catch {
-    throw Object.assign(new Error("Target URL encoding is invalid."), {
-      statusCode: 400,
-    });
+    throw httpError(400, "Target URL encoding is invalid.");
   }
 
   let target;
 
-  if (rawPath.startsWith("http://") || rawPath.startsWith("https://")) {
-    try {
+  try {
+    if (/^https?:\/\//i.test(rawPath)) {
       target = new URL(rawPath);
-    } catch {
-      throw Object.assign(new Error("Target URL is invalid."), {
-        statusCode: 400,
-      });
-    }
-  } else {
-    const parts = rawPath.split("/");
-    const first = (parts[0] || "").replace(/:$/, "").toLowerCase();
-    const protocol = first === "http" || first === "https" ? first : "https";
-    const hostIndex = protocol === first ? 1 : 0;
-    const host = parts[hostIndex] || "";
+    } else {
+      const parts = rawPath.split("/");
+      const first = (parts[0] || "").replace(/:$/, "").toLowerCase();
+      const protocol = first === "http" || first === "https" ? first : "https";
+      const offset = protocol === first ? 1 : 0;
+      const host = parts[offset] || "";
 
-    if (!host) {
-      return null;
-    }
+      if (!host) {
+        return null;
+      }
 
-    try {
       target = new URL(`${protocol}://${host}`);
-      target.pathname = `/${parts.slice(hostIndex + 1).join("/")}`;
-    } catch {
-      throw Object.assign(new Error("Target URL is invalid."), {
-        statusCode: 400,
-      });
+      target.pathname = `/${parts.slice(offset + 1).join("/")}`;
     }
+  } catch {
+    throw httpError(400, "Target URL is invalid.");
   }
 
-  for (const [key, value] of url.searchParams.entries()) {
-    if (key !== PATH_QUERY_KEY) {
+  requestUrl.searchParams.forEach((value, key) => {
+    if (key !== PROXY_PARAM) {
       target.searchParams.append(key, value);
     }
-  }
+  });
 
   return target;
 }
 
-function buildRequestHeaders(request, targetUrl) {
+function buildRequestHeaders(request, targetUrl, proxyOrigin) {
   const headers = new Headers();
 
-  for (const [key, value] of request.headers.entries()) {
-    if (!HOP_BY_HOP_REQUEST_HEADERS.has(key.toLowerCase())) {
+  request.headers.forEach((value, key) => {
+    if (!REQUEST_HOP_HEADERS.has(key.toLowerCase())) {
       headers.set(key, value);
     }
-  }
+  });
+
+  const proxyUrl = new URL(proxyOrigin || request.url);
+  const forwardedFor = firstHeader(request.headers, "x-forwarded-for");
 
   headers.set("host", targetUrl.host);
   headers.set("accept-encoding", "identity");
-
-  const forwardedFor = getForwardedHeader(request.headers, "x-forwarded-for");
-  const { host: forwardedHost, protocol: forwardedProto } =
-    getRequestOrigin(request);
+  headers.set("x-forwarded-host", proxyUrl.host);
+  headers.set("x-forwarded-proto", proxyUrl.protocol.slice(0, -1));
 
   if (forwardedFor) {
     headers.set("x-forwarded-for", forwardedFor);
   }
 
-  if (forwardedHost) {
-    headers.set("x-forwarded-host", forwardedHost);
-  }
-
-  headers.set("x-forwarded-proto", forwardedProto);
-
   return headers;
 }
 
-function toProxyUrl(value, request, targetUrl) {
-  if (!value) {
-    return value;
-  }
-
-  const trimmed = value.trim();
+function toProxyUrl(value, proxyOrigin, targetUrl) {
+  const trimmed = value?.trim();
 
   if (
+    !proxyOrigin ||
     !trimmed ||
-    trimmed.startsWith("#") ||
-    trimmed.startsWith("data:") ||
-    trimmed.startsWith("javascript:") ||
-    trimmed.startsWith("mailto:") ||
-    trimmed.startsWith("tel:")
+    /^(#|data:|javascript:|mailto:|tel:)/i.test(trimmed)
   ) {
-    return value;
-  }
-
-  const proxyBaseUrl = getProxyBaseUrl(request);
-
-  if (!proxyBaseUrl) {
     return value;
   }
 
@@ -197,81 +159,69 @@ function toProxyUrl(value, request, targetUrl) {
       return value;
     }
 
-    return new URL(`/${absolute.toString()}`, proxyBaseUrl).toString();
+    return new URL(`/${absolute.toString()}`, proxyOrigin).toString();
   } catch {
     return value;
   }
 }
 
-function rewriteLocationHeader(location, request, targetUrl) {
-  return toProxyUrl(location, request, targetUrl);
-}
+function rewriteHtml(html, proxyOrigin, targetUrl) {
+  const rewrite = (value) => toProxyUrl(value, proxyOrigin, targetUrl);
 
-function rewriteSrcset(value, request, targetUrl) {
-  return value
-    .split(",")
-    .map((candidate) => {
-      const trimmed = candidate.trim();
-
-      if (!trimmed) {
-        return trimmed;
-      }
-
-      const firstSpace = trimmed.search(/\s/);
-
-      if (firstSpace === -1) {
-        return toProxyUrl(trimmed, request, targetUrl);
-      }
-
-      const urlPart = trimmed.slice(0, firstSpace);
-      const descriptor = trimmed.slice(firstSpace);
-
-      return `${toProxyUrl(urlPart, request, targetUrl)}${descriptor}`;
-    })
-    .join(", ");
-}
-
-function rewriteHtml(html, request, targetUrl) {
   return html
     .replace(
       /\b(href|src|action|poster)=("([^"]*)"|'([^']*)')/gi,
-      (match, attr, quoted, doubleValue, singleValue) => {
-        const original = doubleValue ?? singleValue ?? "";
-        const rewritten = toProxyUrl(original, request, targetUrl);
+      (_, attr, quoted, doubleValue, singleValue) => {
         const quote = quoted[0];
-        return `${attr}=${quote}${rewritten}${quote}`;
+        const value = doubleValue ?? singleValue ?? "";
+        return `${attr}=${quote}${rewrite(value)}${quote}`;
       },
     )
     .replace(
       /\bsrcset=("([^"]*)"|'([^']*)')/gi,
-      (match, quoted, doubleValue, singleValue) => {
-        const original = doubleValue ?? singleValue ?? "";
-        const rewritten = rewriteSrcset(original, request, targetUrl);
+      (_, quoted, doubleValue, singleValue) => {
         const quote = quoted[0];
+        const value = doubleValue ?? singleValue ?? "";
+        const rewritten = value
+          .split(",")
+          .map((item) => {
+            const candidate = item.trim();
+
+            if (!candidate) {
+              return candidate;
+            }
+
+            const separator = candidate.search(/\s/);
+
+            if (separator === -1) {
+              return rewrite(candidate);
+            }
+
+            return `${rewrite(candidate.slice(0, separator))}${candidate.slice(separator)}`;
+          })
+          .join(", ");
+
         return `srcset=${quote}${rewritten}${quote}`;
       },
     )
     .replace(
       /\bcontent=("([^"]*)"|'([^']*)')/gi,
       (match, quoted, doubleValue, singleValue) => {
-        const original = doubleValue ?? singleValue ?? "";
-        const rewritten = original.replace(
+        const quote = quoted[0];
+        const value = doubleValue ?? singleValue ?? "";
+        const rewritten = value.replace(
           /(\s*;\s*url=)([^;]+)/i,
-          (full, prefix, target) =>
-            `${prefix}${toProxyUrl(target, request, targetUrl)}`,
+          (_, prefix, target) => `${prefix}${rewrite(target)}`,
         );
 
-        if (rewritten === original) {
-          return match;
-        }
-
-        const quote = quoted[0];
-        return `content=${quote}${rewritten}${quote}`;
+        return rewritten === value
+          ? match
+          : `content=${quote}${rewritten}${quote}`;
       },
     );
 }
 
-function buildResponseHeaders(upstream, request, targetUrl) {
+function buildResponseHeaders(upstream, proxyOrigin, targetUrl) {
   const headers = new Headers({
     "cache-control": "no-store",
   });
@@ -285,23 +235,19 @@ function buildResponseHeaders(upstream, request, targetUrl) {
   upstream.headers.forEach((value, key) => {
     const lower = key.toLowerCase();
 
-    if (lower === "set-cookie" || HOP_BY_HOP_RESPONSE_HEADERS.has(lower)) {
-      return;
-    }
-
     if (
+      lower === "set-cookie" ||
       lower === "content-security-policy" ||
-      lower === "content-security-policy-report-only"
+      lower === "content-security-policy-report-only" ||
+      RESPONSE_HOP_HEADERS.has(lower)
     ) {
       return;
     }
 
-    if (lower === "location") {
-      headers.set(key, rewriteLocationHeader(value, request, targetUrl));
-      return;
-    }
-
-    headers.set(key, value);
+    headers.set(
+      key,
+      lower === "location" ? toProxyUrl(value, proxyOrigin, targetUrl) : value,
+    );
   });
 
   return headers;
@@ -313,41 +259,40 @@ async function getErrorMessage(upstream) {
       ? "URL not found."
       : upstream.statusText || "Request failed.";
 
-  let body = "";
-
   try {
-    body = (await upstream.text()).trim();
+    const body = (await upstream.text()).trim();
+
+    if (!body) {
+      return fallback;
+    }
+
+    if (
+      (upstream.headers.get("content-type") || "").includes("application/json")
+    ) {
+      try {
+        const data = JSON.parse(body);
+
+        if (typeof data?.message === "string" && data.message.trim()) {
+          return data.message.trim();
+        }
+
+        if (typeof data?.error === "string" && data.error.trim()) {
+          return data.error.trim();
+        }
+      } catch {}
+    }
+
+    return body;
   } catch {
     return fallback;
   }
-
-  if (!body) {
-    return fallback;
-  }
-
-  const contentType = upstream.headers.get("content-type") || "";
-
-  if (contentType.includes("application/json")) {
-    try {
-      const data = JSON.parse(body);
-
-      if (typeof data?.message === "string" && data.message.trim()) {
-        return data.message.trim();
-      }
-
-      if (typeof data?.error === "string" && data.error.trim()) {
-        return data.error.trim();
-      }
-    } catch {}
-  }
-
-  return body;
 }
 
-export default async function handler(request) {
+async function handleRequest(request) {
   try {
-    const url = new URL(request.url);
-    const targetUrl = buildTargetUrl(url);
+    const requestUrl = new URL(request.url);
+    const proxyOrigin = getProxyOrigin(request);
+    const targetUrl = buildTargetUrl(requestUrl);
 
     if (!targetUrl) {
       return json(400, "Target URL is required.");
@@ -355,7 +300,7 @@ export default async function handler(request) {
 
     const init = {
       method: request.method,
-      headers: buildRequestHeaders(request, targetUrl),
+      headers: buildRequestHeaders(request, targetUrl, proxyOrigin),
       redirect: "manual",
     };
 
@@ -370,25 +315,25 @@ export default async function handler(request) {
       return json(upstream.status, await getErrorMessage(upstream));
     }
 
-    const contentType = upstream.headers.get("content-type") || "";
-    const headers = buildResponseHeaders(upstream, request, targetUrl);
-
-    if (contentType.includes("text/html")) {
-      return new Response(
-        rewriteHtml(await upstream.text(), request, targetUrl),
-        {
-          status: upstream.status,
-          statusText: upstream.statusText,
-          headers,
-        },
-      );
-    }
-
-    return new Response(request.method === "HEAD" ? null : upstream.body, {
+    const headers = buildResponseHeaders(upstream, proxyOrigin, targetUrl);
+    const responseInit = {
       status: upstream.status,
       statusText: upstream.statusText,
       headers,
-    });
+    };
+
+    if (request.method === "HEAD") {
+      return new Response(null, responseInit);
+    }
+
+    if ((upstream.headers.get("content-type") || "").includes("text/html")) {
+      return new Response(
+        rewriteHtml(await upstream.text(), proxyOrigin, targetUrl),
+        responseInit,
+      );
+    }
+
+    return new Response(upstream.body, responseInit);
   } catch (error) {
     return json(
       typeof error?.statusCode === "number" ? error.statusCode : 502,
@@ -396,3 +341,7 @@ export default async function handler(request) {
     );
   }
 }
+
+export default {
+  fetch: handleRequest,
+};
